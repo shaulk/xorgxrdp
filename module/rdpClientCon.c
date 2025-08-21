@@ -52,6 +52,10 @@ Client connection to xrdp
 #include "rdpCapture.h"
 #include "rdpRandR.h"
 
+#if defined(XORGXRDP_GLAMOR)
+#include "rdpEgl.h"
+#endif
+
 #define LOG_LEVEL 1
 #define LLOGLN(_level, _args) \
     do { if (_level < LOG_LEVEL) { ErrorF _args ; ErrorF("\n"); } } while (0)
@@ -220,6 +224,7 @@ rdpClientConGotConnection(ScreenPtr pScreen, rdpPtr dev)
     clientCon->updateRetries = 0;
     clientCon->dev = dev;
     clientCon->shmemfd = -1;
+    clientCon->dma_buf_active = 0;
     dev->last_event_time_ms = GetTimeInMillis();
     dev->do_dirty_ons = 1;
 
@@ -749,6 +754,9 @@ convertSharedMemoryStatusToActive(enum shared_memory_status status) {
     }
 }
 
+int
+rdpClientConPreCheck(rdpPtr dev, rdpClientCon *clientCon, int in_size);
+
 /******************************************************************************/
 /**
  * Resizes all memory areas following a change in client geometry or
@@ -898,6 +906,58 @@ rdpClientConResizeAllMemoryAreas(rdpPtr dev, rdpClientCon *clientCon)
     }
 }
 
+static int
+rdpClientConNotifyDmaBufStateOnly(rdpPtr dev, rdpClientCon *clientCon, enum dma_buf_server_notify state)
+{
+    int size = 6;
+    rdpClientConPreCheck(dev, clientCon, size);
+    out_uint16_le(clientCon->out_s, 65); /* DMA-BUF server state notification */
+    out_uint16_le(clientCon->out_s, size); /* size */
+    clientCon->count++;
+    out_uint16_le(clientCon->out_s, state);
+    rdpClientConSendPending(clientCon->dev, clientCon);
+    return 0;
+}
+
+/******************************************************************************/
+static int
+rdpClientConActivateDmaBuf(rdpPtr dev, rdpClientCon *clientCon)
+{
+#ifdef XORGXRDP_GLAMOR
+    LLOGLN(0, ("rdpClientConActivateDmaBuf:"));
+    int rv;
+    struct rdp_dma_buf_info dma_buf_info = {0};
+    int fd = rdpEglGetPixmapFd(dev, &dma_buf_info);
+    if (fd == -1)
+    {
+        return rdpClientConNotifyDmaBufStateOnly(dev, clientCon, DMA_BUF_NOT_SUPPORTED);
+    }
+
+    int size = 24;
+    rdpClientConPreCheck(dev, clientCon, size);
+    out_uint16_le(clientCon->out_s, 65); /* DMA-BUF server state notification */
+    out_uint16_le(clientCon->out_s, size); /* size */
+    clientCon->count++;
+    out_uint16_le(clientCon->out_s, DMA_BUF_ACTIVATE_WITH_FD); /* state */
+    out_uint32_le(clientCon->out_s, dma_buf_info.width);
+    out_uint32_le(clientCon->out_s, dma_buf_info.height);
+    out_uint16_le(clientCon->out_s, dma_buf_info.stride);
+    out_uint32_le(clientCon->out_s, dma_buf_info.size);
+    out_uint32_le(clientCon->out_s, dma_buf_info.format);
+    rdpClientConSendPending(clientCon->dev, clientCon);
+    rv = g_sck_send_fd_set(clientCon->sck, "int", 4, &fd, 1);
+    if (rv == -1)
+    {
+        LLOGLN(0, ("rdpClientConActivateDmaBuf: send dma buf pixmap fd failed"));
+    }
+    close(fd);
+#endif
+    return 0;
+}
+
+static int
+rdpClientConDeactivateDmaBuf(rdpPtr dev, rdpClientCon *clientCon);
+
 /******************************************************************************/
 static int
 rdpClientConProcessMonitorUpdateMsg(rdpPtr dev, rdpClientCon *clientCon,
@@ -919,6 +979,7 @@ rdpClientConProcessMonitorUpdateMsg(rdpPtr dev, rdpClientCon *clientCon,
     clientCon->client_info.display_sizes.session_width = width;
     clientCon->client_info.display_sizes.session_height = height;
 
+    rdpClientConDeactivateDmaBuf(dev, clientCon);
     rdpClientConResizeAllMemoryAreas(dev, clientCon);
     rdpClientConProcessClientInfoMonitors(dev, clientCon);
 
@@ -1004,9 +1065,6 @@ rdpClientConProcessMsgClientInput(rdpPtr dev, rdpClientCon *clientCon)
 
     return 0;
 }
-
-int
-rdpClientConPreCheck(rdpPtr dev, rdpClientCon *clientCon, int in_size);
 
 /******************************************************************************/
 static int
@@ -1300,6 +1358,55 @@ rdpClientConProcessMsgClientRegionEx(rdpPtr dev, rdpClientCon *clientCon)
 
 /******************************************************************************/
 static int
+rdpClientConProcessMsgClientDmaBufNotify(rdpPtr dev, rdpClientCon *clientCon)
+{
+    enum dma_buf_client_notify notify_type;
+    struct stream *s;
+
+    LLOGLN(0, ("rdpClientConProcessMsgClientDmaBufNotify:"));
+    s = clientCon->in_s;
+    in_uint16_le(s, notify_type);
+
+#ifndef XORGXRDP_GLAMOR
+    rdpClientConNotifyDmaBufStateOnly(dev, clientCon, DMA_BUF_NOT_SUPPORTED);
+    LLOGLN(0, ("rdpClientConProcessMsgClientDmaBufNotify: Notifying client that DMA-BUF capture is not supported"));
+    return 0;
+#endif
+
+    LLOGLN(0, ("rdpClientConProcessMsgClientDmaBufNotify: notify_type %d", notify_type));
+    switch (notify_type) {
+        case DMA_BUF_NOTIFY_ACTIVE:
+            LLOGLN(0, ("rdpClientConProcessMsgClientDmaBufNotify: Client reports DMA-BUF is active, using it for screen updates"));
+            clientCon->dma_buf_active = 1;
+            break;
+        case DMA_BUF_NOTIFY_INACTIVE:
+            LLOGLN(0, ("rdpClientConProcessMsgClientDmaBufNotify: Client reports DMA-BUF is inactive, falling back to standard capture"));
+            clientCon->dma_buf_active = 0;
+            break;
+        case DMA_BUF_REQUEST_ACTIVATE:
+            LLOGLN(0, ("rdpClientConProcessMsgClientDmaBufNotify: Client requests to activate DMA-BUF"));
+            rdpClientConActivateDmaBuf(dev, clientCon);
+            break;
+        default:
+            LLOGLN(0, ("rdpClientConProcessMsgClientDmaBufNotify: unknown notify_type %d", notify_type));
+            break;
+    }
+    return 0;
+}
+
+static int
+rdpClientConDeactivateDmaBuf(rdpPtr dev, rdpClientCon *clientCon)
+{
+    LLOGLN(0, ("rdpClientConDeactivateDmaBuf:"));
+    if (clientCon->dma_buf_active) {
+        rdpClientConNotifyDmaBufStateOnly(dev, clientCon, DMA_BUF_DEACTIVATE);
+        clientCon->dma_buf_active = 0;
+    }
+    return 0;
+}
+
+/******************************************************************************/
+static int
 rdpClientConProcessMsgClientSuppressOutput(rdpPtr dev, rdpClientCon *clientCon)
 {
     int suppress;
@@ -1354,6 +1461,9 @@ rdpClientConProcessMsg(rdpPtr dev, rdpClientCon *clientCon)
             break;
         case 108: /* client suppress output */
             rdpClientConProcessMsgClientSuppressOutput(dev, clientCon);
+            break;
+        case 109: /* client dma buf notify */
+            rdpClientConProcessMsgClientDmaBufNotify(dev, clientCon);
             break;
         default:
             LLOGLN(0, ("rdpClientConProcessMsg: unknown msg_type %d",
@@ -2906,6 +3016,15 @@ rdpCapRect(rdpClientCon *clientCon, BoxPtr cap_rect, int mon,
     return 0;
 }
 
+static int
+rdpCapRectDmaBuf(rdpPtr dev, rdpClientCon *clientCon, BoxPtr cap_rect, int mon,
+           struct image_data *id)
+{
+    LLOGLN(10, ("rdpCapRectDmaBuf:"));
+    rdpClientConNotifyDmaBufStateOnly(dev, clientCon, DMA_BUF_PAINT);
+    return 0;
+}
+
 /******************************************************************************/
 static CARD32
 rdpDeferredUpdateCallback(OsTimerPtr timer, CARD32 now, pointer arg)
@@ -2940,6 +3059,12 @@ rdpDeferredUpdateCallback(OsTimerPtr timer, CARD32 now, pointer arg)
     clientCon->lastUpdateTime = now;
     LLOGLN(10, ("rdpDeferredUpdateCallback: sending"));
     clientCon->updateRetries = 0;
+
+    if (clientCon->dma_buf_active)
+    {
+        return rdpCapRectDmaBuf(clientCon->dev, clientCon, &cap_rect, 0, &id);
+    }
+
     if (clientCon->dev->monitorCount < 1)
     {
         cap_rect.x1 = 0;

@@ -796,3 +796,54 @@ rdpEglCaptureRfx(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
     free(crcs);
     return TRUE;
 }
+
+int
+rdpEglGetPixmapFd(rdpPtr dev, struct rdp_dma_buf_info *dma_buf_info)
+{
+    ScreenPtr pScreen;
+    PixmapPtr screenPixmap;
+    CARD16 stride;
+    CARD32 size;
+
+    if (!dev->glamor)
+    {
+        LLOGLN(0, ("rdpEglGetPixmapFd: glamor not enabled, not sending pixmap fd as the client requested."));
+        return -1;
+    }
+
+    pScreen = dev->pScreen;
+    screenPixmap = pScreen->GetScreenPixmap(pScreen);
+    if (screenPixmap == NULL)
+    {
+        LLOGLN(0, ("rdpEglGetPixmapFd: GetScreenPixmap failed"));
+        return -1;
+    }
+
+    dma_buf_info->width = screenPixmap->drawable.width;
+    dma_buf_info->height = screenPixmap->drawable.height;
+    switch (screenPixmap->drawable.depth)
+    {
+        case 16:
+            dma_buf_info->format = DRM_FORMAT_RGB565;
+            break;
+        case 24:
+        case 32:
+            dma_buf_info->format = DRM_FORMAT_XRGB8888;
+            break;
+        default:
+            LLOGLN(0, ("rdpEglGetPixmapFd: unsupported depth %d", screenPixmap->drawable.depth));
+            return -1;
+    }
+
+    int fd = glamor_fd_from_pixmap(pScreen, screenPixmap, &stride, &size);
+    if (fd == -1)
+    {
+        LLOGLN(0, ("rdpEglGetPixmapFd: glamor_fd_from_pixmap failed"));
+        return -1;
+    }
+
+    dma_buf_info->stride = stride;
+    dma_buf_info->size = size;
+
+    return fd;
+}
