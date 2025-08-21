@@ -24,6 +24,15 @@ EGL
 #ifndef _RDPEGL_H
 #define _RDPEGL_H
 
+struct rdp_dma_buf_info
+{
+    uint32_t width;
+    uint32_t height;
+    uint16_t stride;
+    uint32_t size;
+    uint32_t format;
+};
+
 extern _X_EXPORT void *
 rdpEglCreate(ScreenPtr screen);
 extern _X_EXPORT int
@@ -31,5 +40,7 @@ rdpEglDestroy(void *eglptr);
 extern _X_EXPORT Bool
 rdpEglCaptureRfx(rdpClientCon *clientCon, RegionPtr in_reg, BoxPtr *out_rects,
                  int *num_out_rects, struct image_data *id);
+int
+rdpEglGetPixmapFd(rdpPtr dev, struct rdp_dma_buf_info *dma_buf_info);
 
 #endif
